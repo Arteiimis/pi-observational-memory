@@ -179,6 +179,8 @@ function normalizeSettingsConfig(value) {
   if (typeof value.debugLog === "boolean") normalized.debugLog = value.debugLog;
   const model = normalizeModel(value.model);
   if (model) normalized.model = model;
+  const fallbackModel = normalizeModel(value.fallbackModel);
+  if (fallbackModel) normalized.fallbackModel = fallbackModel;
   return normalized;
 }
 function readEnvConfig(env = process.env) {
@@ -2328,9 +2330,48 @@ function anyStageDue(entries, runtime, currentTokens) {
 function shouldNotifyWorker(runtime, ctx) {
   return runtime.config.showWorkerNotifications && ctx.hasUI;
 }
+function workerHeadersFor(ctx, resolved) {
+  const model = resolved.model ?? {};
+  if (model.provider !== "opencode" && model.provider !== "opencode-go" && !(typeof model.baseUrl === "string" && model.baseUrl.includes("opencode.ai"))) {
+    return resolved;
+  }
+  const sessionId = ctx.sessionManager.getSessionId?.();
+  if (!sessionId) return resolved;
+  return {
+    ...resolved,
+    headers: {
+      ...resolved.headers ?? {},
+      "x-opencode-session": sessionId,
+      "x-opencode-client": "pi"
+    }
+  };
+}
+function workerThinkingLevel(runtime, resolved) {
+  if (resolved.fallbackUsed === true) {
+    return runtime.config.fallbackModel?.thinking ?? runtime.config.model?.thinking ?? "low";
+  }
+  return runtime.config.model?.thinking ?? "low";
+}
+function observerChunkContextWindow(runtime, ctx, resolved) {
+  const primary = resolved.model?.contextWindow;
+  const fallback = runtime.config.fallbackModel;
+  if (!fallback) return primary;
+  const fallbackModel = ctx.modelRegistry.find?.(fallback.provider, fallback.id);
+  const usablePrimary = typeof primary === "number" && primary > 0 ? primary : void 0;
+  const fallbackWindow = fallbackModel?.contextWindow;
+  const usableFallback = typeof fallbackWindow === "number" && fallbackWindow > 0 ? fallbackWindow : void 0;
+  if (usablePrimary === void 0) return usableFallback;
+  if (usableFallback === void 0) return usablePrimary;
+  return Math.min(usablePrimary, usableFallback);
+}
 function makeModelResolver(runtime, ctx) {
   let cached;
-  return async (stage) => {
+  let fallbackActive;
+  const resolve = async (stage) => {
+    if (fallbackActive) {
+      runtime.resolveFailureNotified = false;
+      return fallbackActive;
+    }
     cached ??= await runtime.resolveModel({
       model: ctx.model,
       modelRegistry: ctx.modelRegistry,
@@ -2339,21 +2380,7 @@ function makeModelResolver(runtime, ctx) {
     });
     if (cached.ok) {
       runtime.resolveFailureNotified = false;
-      const model = cached.model ?? {};
-      if (model.provider === "opencode" || model.provider === "opencode-go" || typeof model.baseUrl === "string" && model.baseUrl.includes("opencode.ai")) {
-        const sessionId = ctx.sessionManager.getSessionId?.();
-        if (sessionId) {
-          return {
-            ...cached,
-            headers: {
-              ...cached.headers ?? {},
-              "x-opencode-session": sessionId,
-              "x-opencode-client": "pi"
-            }
-          };
-        }
-      }
-      return cached;
+      return workerHeadersFor(ctx, cached);
     }
     debugLog(`${stage}.model_unavailable`, { reason: cached.reason });
     if (!runtime.resolveFailureNotified && ctx.hasUI && ctx.ui) {
@@ -2362,6 +2389,55 @@ function makeModelResolver(runtime, ctx) {
     }
     return void 0;
   };
+  const resolveFallback = async (stage) => {
+    if (fallbackActive) return fallbackActive;
+    const resolveFallbackModel = runtime.resolveFallbackModel;
+    if (typeof resolveFallbackModel !== "function") {
+      debugLog(`${stage}.fallback_unavailable`, { reason: "runtime exposes no resolveFallbackModel" });
+      return void 0;
+    }
+    const resolvedCtx = {
+      model: ctx.model,
+      modelRegistry: ctx.modelRegistry,
+      hasUI: ctx.hasUI,
+      ui: ctx.ui
+    };
+    const result = await resolveFallbackModel.call(runtime, resolvedCtx);
+    if (!result.ok) {
+      debugLog(`${stage}.fallback_unavailable`, { reason: result.reason });
+      return void 0;
+    }
+    const resolved = workerHeadersFor(ctx, { ...result, fallbackUsed: true });
+    fallbackActive = resolved;
+    debugLog(`${stage}.fallback_active`, {
+      provider: resolved.model?.provider,
+      id: resolved.model?.id
+    });
+    return resolved;
+  };
+  return { resolve, resolveFallback };
+}
+async function runStageWithFallback(ctx, stage, resolved, resolver, work) {
+  try {
+    return await work(resolved);
+  } catch (primaryError) {
+    if (resolved.fallbackUsed === true) throw primaryError;
+    const fallback = await resolver.resolveFallback(stage);
+    if (!fallback) throw primaryError;
+    const message = primaryError instanceof Error ? primaryError.message : String(primaryError);
+    debugLog(`${stage}.fallback_retry`, {
+      primaryError: message,
+      provider: fallback.model?.provider,
+      id: fallback.model?.id
+    });
+    if (ctx.hasUI && ctx.ui) {
+      ctx.ui.notify(
+        `Observational memory: ${stage} failed (${message}); retrying with fallback model`,
+        "warning"
+      );
+    }
+    return await work(fallback);
+  }
 }
 function registerConsolidationTrigger(pi, runtime) {
   const launch = (_event, ctx) => {
@@ -2407,10 +2483,10 @@ function maybeLaunchConsolidation(pi, runtime, ctx) {
   }));
 }
 async function runConsolidationPipeline(pi, runtime, ctx) {
-  const resolveModel = makeModelResolver(runtime, ctx);
+  const resolver = makeModelResolver(runtime, ctx);
   runtime.consolidationPhase = "observer";
   try {
-    const observerOutcome = await runObserverStage(pi, runtime, ctx, resolveModel);
+    const observerOutcome = await runObserverStage(pi, runtime, ctx, resolver);
     if (observerOutcome === "abort") return;
   } catch (error) {
     debugLog("observer.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "observer", error) });
@@ -2419,7 +2495,7 @@ async function runConsolidationPipeline(pi, runtime, ctx) {
   runtime.consolidationPhase = "reflector";
   let reflectorResult;
   try {
-    reflectorResult = await runReflectorStage(pi, runtime, ctx, resolveModel);
+    reflectorResult = await runReflectorStage(pi, runtime, ctx, resolver);
     if (reflectorResult.outcome === "abort") return;
   } catch (error) {
     debugLog("reflector.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "reflector", error) });
@@ -2427,12 +2503,12 @@ async function runConsolidationPipeline(pi, runtime, ctx) {
   }
   runtime.consolidationPhase = "dropper";
   try {
-    await runDropperStage(pi, runtime, ctx, resolveModel, reflectorResult.sameRunReflections, reflectorResult.effectiveReflectionCoverageId);
+    await runDropperStage(pi, runtime, ctx, resolver, reflectorResult.sameRunReflections, reflectorResult.effectiveReflectionCoverageId);
   } catch (error) {
     debugLog("dropper.error", { errorMessage: runtime.recordConsolidationStageError(ctx, "dropper", error) });
   }
 }
-async function runObserverStage(pi, runtime, ctx, resolveModel) {
+async function runObserverStage(pi, runtime, ctx, resolver) {
   const entries = ctx.sessionManager.getBranch();
   const currentTokens = realContextTokens(ctx);
   const real = currentTokens !== void 0 ? realTokensSinceAnchor(entries, OM_OBSERVATIONS_RECORDED, currentTokens) : void 0;
@@ -2450,11 +2526,11 @@ async function runObserverStage(pi, runtime, ctx, resolveModel) {
       return "continue";
     }
   }
-  const resolved = await resolveModel("observer");
+  const resolved = await resolver.resolve("observer");
   if (!resolved) return "abort";
   const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
   const backlogEntries = sourceEntriesAfter(entries, lastCoverageIdx);
-  const contextWindow = resolved.model.contextWindow;
+  const contextWindow = observerChunkContextWindow(runtime, ctx, resolved);
   const maxChunkTokens = resolveObserverChunkMaxTokens(runtime.config, contextWindow);
   const {
     text: chunk,
@@ -2493,20 +2569,20 @@ async function runObserverStage(pi, runtime, ctx, resolveModel) {
   });
   let observations;
   try {
-    observations = await runObserver({
-      model: resolved.model,
-      apiKey: resolved.apiKey,
-      headers: resolved.headers,
-      env: resolved.env,
+    observations = await runStageWithFallback(ctx, "observer", resolved, resolver, (worker) => runObserver({
+      model: worker.model,
+      apiKey: worker.apiKey,
+      headers: worker.headers,
+      env: worker.env,
       priorReflections,
       priorObservations,
       chunk,
       allowedSourceEntryIds: sourceEntryIds,
       maxTurns: runtime.config.agentMaxTurns,
       maxOutputTokens: runtime.config.agentMaxTokens,
-      thinkingLevel: runtime.config.model?.thinking ?? "low",
+      thinkingLevel: workerThinkingLevel(runtime, worker),
       modelRegistry: ctx.modelRegistry
-    });
+    }));
   } catch (error) {
     if (error instanceof ObserverStreamError) {
       runtime.recordConsolidationStageError(ctx, "observer", error);
@@ -2539,7 +2615,7 @@ async function runObserverStage(pi, runtime, ctx, resolveModel) {
   );
   return "continue";
 }
-async function runReflectorStage(pi, runtime, ctx, resolveModel) {
+async function runReflectorStage(pi, runtime, ctx, resolver) {
   const entries = ctx.sessionManager.getBranch();
   const currentTokens = realContextTokens(ctx);
   const real = currentTokens !== void 0 ? realTokensSinceAnchor(entries, OM_REFLECTIONS_RECORDED, currentTokens) : void 0;
@@ -2551,21 +2627,21 @@ async function runReflectorStage(pi, runtime, ctx, resolveModel) {
     `Observational memory: reflector running (~${reflectionTokens.toLocaleString()} tokens)`,
     "info"
   );
-  const resolved = await resolveModel("reflector");
+  const resolved = await resolver.resolve("reflector");
   if (!resolved) return { outcome: "abort", sameRunReflections: [] };
   const folded = foldLedger(entries);
-  const reflections = await runReflector({
-    model: resolved.model,
-    apiKey: resolved.apiKey,
-    headers: resolved.headers,
-    env: resolved.env,
+  const reflections = await runStageWithFallback(ctx, "reflector", resolved, resolver, (worker) => runReflector({
+    model: worker.model,
+    apiKey: worker.apiKey,
+    headers: worker.headers,
+    env: worker.env,
     reflections: folded.reflections,
     observations: folded.activeObservations,
     maxTurns: runtime.config.agentMaxTurns,
     maxOutputTokens: runtime.config.agentMaxTokens,
-    thinkingLevel: runtime.config.model?.thinking ?? "low",
+    thinkingLevel: workerThinkingLevel(runtime, worker),
     modelRegistry: ctx.modelRegistry
-  });
+  }));
   if (!reflections) return { outcome: "continue", sameRunReflections: [] };
   const data = buildReflectionsRecordedData(reflections, observationCoverageId);
   if (!data) return { outcome: "continue", sameRunReflections: [] };
@@ -2576,7 +2652,7 @@ async function runReflectorStage(pi, runtime, ctx, resolveModel) {
     effectiveReflectionCoverageId: data.coversUpToId
   };
 }
-async function runDropperStage(pi, runtime, ctx, resolveModel, sameRunReflections, sameRunReflectionCoverageId) {
+async function runDropperStage(pi, runtime, ctx, resolver, sameRunReflections, sameRunReflectionCoverageId) {
   if (!sameRunReflectionCoverageId || sameRunReflections.length === 0) {
     debugLog("dropper.waiting_for_reflection", { sameRunReflections: sameRunReflections.length });
     return "continue";
@@ -2613,22 +2689,22 @@ async function runDropperStage(pi, runtime, ctx, resolveModel, sameRunReflection
     `Observational memory: dropper running after reflection \u2014 active observation pool ~${metrics.observationTokens.toLocaleString()} / ${metrics.targetTokens.toLocaleString()} target tokens (${Math.round(metrics.fullness * 100).toLocaleString()}%)`,
     "info"
   );
-  const resolved = await resolveModel("dropper");
+  const resolved = await resolver.resolve("dropper");
   if (!resolved) return "abort";
   const reflectionsForDropper = mergeReflections(folded.reflections, sameRunReflections);
-  const droppedIds = await runDropper({
-    model: resolved.model,
-    apiKey: resolved.apiKey,
-    headers: resolved.headers,
-    env: resolved.env,
+  const droppedIds = await runStageWithFallback(ctx, "dropper", resolved, resolver, (worker) => runDropper({
+    model: worker.model,
+    apiKey: worker.apiKey,
+    headers: worker.headers,
+    env: worker.env,
     reflections: reflectionsForDropper,
     observations: folded.activeObservations,
     targetTokens: runtime.config.observationsPoolTargetTokens,
     maxTurns: runtime.config.agentMaxTurns,
     maxOutputTokens: runtime.config.agentMaxTokens,
-    thinkingLevel: runtime.config.model?.thinking ?? "low",
+    thinkingLevel: workerThinkingLevel(runtime, worker),
     modelRegistry: ctx.modelRegistry
-  });
+  }));
   const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, sameRunReflectionCoverageId);
   const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : void 0;
   debugLog("dropper.append", {
@@ -2685,7 +2761,35 @@ var Runtime = class {
     this.config = loadConfig(cwd);
     this.configLoaded = true;
   }
+  /**
+   * Resolve the model memory workers should use.
+   *
+   * Order: `config.model` (falling back to the session model when it is absent
+   * from Pi's registry), then `config.fallbackModel` when the primary resolution
+   * fails. With no fallback configured the primary reason is returned unchanged;
+   * with a configured-but-broken fallback both reasons are reported.
+   */
   async resolveModel(ctx) {
+    const primary = await this.resolvePrimaryModel(ctx);
+    if (primary.ok) return primary;
+    const fallback = await this.resolveFallbackModel(ctx);
+    if (!fallback.ok) {
+      return this.config.fallbackModel ? { ok: false, reason: `${primary.reason}; ${fallback.reason}` } : primary;
+    }
+    const target = this.config.fallbackModel;
+    const provider = fallback.model.provider ?? target?.provider ?? "unknown";
+    const id = fallback.model.id ?? target?.id ?? "unknown";
+    if (ctx.hasUI && ctx.ui) {
+      ctx.ui.notify(
+        `Observational memory: primary model unavailable (${primary.reason}); using fallback ${provider}/${id}`,
+        "warning"
+      );
+    }
+    debugLog("resolve.fallback_used", { provider, id, primaryFailure: primary.reason });
+    return { ...fallback, fallbackUsed: true, primaryFailure: primary.reason };
+  }
+  /** `config.model` when it resolves in Pi's registry, otherwise the session model. */
+  async resolvePrimaryModel(ctx) {
     let model = ctx.model;
     if (this.config.model) {
       const configured = ctx.modelRegistry.find(this.config.model.provider, this.config.model.id);
@@ -2699,6 +2803,29 @@ var Runtime = class {
       }
     }
     if (!model) return { ok: false, reason: "no model available (session has no model and no observational-memory model configured)" };
+    return this.resolveCandidate(ctx, model);
+  }
+  /**
+   * Resolve `config.fallbackModel` with the same auth rules as the primary path.
+   * Exposed so the consolidation stages can retry a failed model call once.
+   * Returns `ok: false` when unset, identical to the configured primary, absent
+   * from the registry, or carrying no usable credentials.
+   */
+  async resolveFallbackModel(ctx) {
+    const target = this.config.fallbackModel;
+    if (!target) return { ok: false, reason: "no fallback model configured" };
+    const configured = this.config.model;
+    const configuredResolved = configured ? ctx.modelRegistry.find(configured.provider, configured.id) : void 0;
+    const effectivePrimary = configuredResolved ?? ctx.model;
+    if (effectivePrimary && effectivePrimary.provider === target.provider && effectivePrimary.id === target.id) {
+      return { ok: false, reason: `fallback model ${target.provider}/${target.id} is identical to the effective primary model` };
+    }
+    const model = ctx.modelRegistry.find(target.provider, target.id);
+    if (!model) return { ok: false, reason: `fallback model ${target.provider}/${target.id} not found` };
+    return this.resolveCandidate(ctx, model);
+  }
+  /** Apply Pi's request-auth acceptance rule to one already-selected model. */
+  async resolveCandidate(ctx, model) {
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     const provider = model.provider ?? "unknown";
     const isOAuth = ctx.modelRegistry.isUsingOAuth?.(model) === true;
