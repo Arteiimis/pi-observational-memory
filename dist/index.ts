@@ -1339,6 +1339,14 @@ function coverageTierForObservation(observation, coverageById) {
 }
 
 // src/agents/dropper/agent.ts
+var DropperStreamError = class extends Error {
+  stopReason;
+  constructor(stopReason, errorMessage) {
+    super(`dropper stream ended with stopReason "${stopReason}"${errorMessage ? `: ${errorMessage}` : ""}`);
+    this.name = "DropperStreamError";
+    this.stopReason = stopReason;
+  }
+};
 var RELEVANCE_DROP_RANK = {
   low: 0,
   medium: 1,
@@ -1520,11 +1528,17 @@ This maximum is a hard upper bound, not a target. Drop fewer or none if fewer ob
     signal,
     resolveWorkerStreamSimple(model, args.modelRegistry, args.streamSimple)
   );
+  let streamError;
   for await (const event of stream) {
     logAgentStreamError("dropper", event);
+    const message = event.message;
+    if (message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
+      streamError = { stopReason: message.stopReason, errorMessage: message.errorMessage };
+    }
   }
   await stream.result();
   const droppedIds = selectDropCandidates(proposedDropIds, observations, maxDropsAllowed, reflections);
+  if (droppedIds.length === 0 && streamError) throw new DropperStreamError(streamError.stopReason, streamError.errorMessage);
   const reason = droppedIds.length > 0 ? "selected_nonempty" : toolCallCount === 0 ? "no_tool_call" : proposedDropIds.length === 0 ? "all_filtered" : "selected_empty";
   const selectedDropTokens = droppedIds.reduce((sum, id) => sum + (allowed.get(id)?.tokenCount ?? 0), 0);
   debugLog("dropper.result", {
@@ -2128,6 +2142,14 @@ Examples:
 - ZERO REFLECTIONS: The only new observations are routine command outputs, transient debugging attempts, or partial work with no durable conclusion yet.`;
 
 // src/agents/reflector/agent.ts
+var ReflectorStreamError = class extends Error {
+  stopReason;
+  constructor(stopReason, errorMessage) {
+    super(`reflector stream ended with stopReason "${stopReason}"${errorMessage ? `: ${errorMessage}` : ""}`);
+    this.name = "ReflectorStreamError";
+    this.stopReason = stopReason;
+  }
+};
 var RecordReflectionsSchema = Type3.Object({
   reflections: Type3.Array(
     Type3.Object({
@@ -2276,11 +2298,17 @@ Crystallize any missing durable facts or patterns into new reflections. If nothi
     signal,
     resolveWorkerStreamSimple(model, args.modelRegistry, args.streamSimple)
   );
+  let streamError;
   for await (const event of stream) {
     logAgentStreamError("reflector", event);
+    const message = event.message;
+    if (message?.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
+      streamError = { stopReason: message.stopReason, errorMessage: message.errorMessage };
+    }
   }
   await stream.result();
   const acceptedReflections = Array.from(accumulated.values());
+  if (acceptedReflections.length === 0 && streamError) throw new ReflectorStreamError(streamError.stopReason, streamError.errorMessage);
   const afterCoverageById = reflectionCoverageMap(observations, [...reflections, ...acceptedReflections]);
   debugLog("reflector.result", {
     reason: acceptedReflections.length > 0 ? "accepted_nonempty" : toolCallCount === 0 ? "no_tool_call" : "all_filtered",
